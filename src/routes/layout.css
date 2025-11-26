@@ -4,9 +4,10 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* HyprWhisper pill UI - transparent background */
-html, body {
+/* HyprWhisper pill UI - fully transparent background */
+html, body, :root {
   background: transparent !important;
+  background-color: transparent !important;
 }
 
 :root {
@@ -121,6 +122,7 @@ html, body {
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply text-foreground;
+    background: transparent !important;
   }
 }
