@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "hyprwhisper",
+  "productName": "HyprWhisper",
   "version": "0.1.0",
   "identifier": "com.aarsh.hyprwhisper",
   "build": {
@@ -10,15 +10,30 @@
     "frontendDist": "../build"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
-        "title": "hyprwhisper",
-        "width": 800,
-        "height": 600
+        "title": "HyprWhisper",
+        "label": "main",
+        "width": 400,
+        "height": 300,
+        "minWidth": 320,
+        "minHeight": 200,
+        "resizable": true,
+        "center": true,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": true
       }
     ],
     "security": {
       "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true
     }
   },
   "bundle": {
@@ -31,5 +46,38 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "global-shortcut": {},
+    "shell": {
+      "open": true,
+      "scope": [
+        {
+          "name": "wl-copy",
+          "cmd": "wl-copy",
+          "args": true
+        },
+        {
+          "name": "wtype",
+          "cmd": "wtype",
+          "args": true
+        },
+        {
+          "name": "ydotool",
+          "cmd": "ydotool",
+          "args": true
+        },
+        {
+          "name": "xdotool",
+          "cmd": "xdotool",
+          "args": true
+        },
+        {
+          "name": "xclip",
+          "cmd": "xclip",
+          "args": true
+        }
+      ]
+    }
   }
 }
