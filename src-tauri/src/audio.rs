@@ -1,11 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 // Global static for recording management
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
+static STREAM_READY: AtomicBool = AtomicBool::new(false);
+static SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
 static SAMPLES: once_cell::sync::Lazy<Arc<Mutex<Vec<f32>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
@@ -28,31 +30,29 @@ impl AudioRecorder {
             samples.clear();
         }
 
+        STREAM_READY.store(false, Ordering::SeqCst);
         RECORDING_FLAG.store(true, Ordering::SeqCst);
 
-        // Start recording in a separate thread where the stream lives
-        let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-
+        // Start recording in a separate thread
         thread::spawn(move || {
-            let result = start_recording_internal();
-            tx.send(result).ok();
+            if let Err(e) = start_recording_internal() {
+                eprintln!("Recording error: {}", e);
+                RECORDING_FLAG.store(false, Ordering::SeqCst);
+            }
         });
 
-        // Wait for the recording to start
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(sample_rate)) => {
-                self.sample_rate = sample_rate;
-                Ok(())
-            }
-            Ok(Err(e)) => {
+        // Wait for the stream to be ready
+        let start = std::time::Instant::now();
+        while !STREAM_READY.load(Ordering::SeqCst) {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
                 RECORDING_FLAG.store(false, Ordering::SeqCst);
-                Err(e)
+                return Err("Recording failed to start in time".to_string());
             }
-            Err(_) => {
-                RECORDING_FLAG.store(false, Ordering::SeqCst);
-                Err("Recording failed to start in time".to_string())
-            }
+            thread::sleep(std::time::Duration::from_millis(10));
         }
+
+        self.sample_rate = SAMPLE_RATE.load(Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn stop_recording(&mut self) -> Result<Vec<f32>, String> {
@@ -104,6 +104,38 @@ impl AudioRecorder {
             0.0
         }
     }
+
+    /// Get current samples without stopping the recording
+    /// Returns samples from the specified position onwards
+    pub fn get_samples_from(&self, from_sample: usize) -> Vec<f32> {
+        if let Ok(lock) = SAMPLES.lock() {
+            if from_sample < lock.len() {
+                lock[from_sample..].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get total number of samples recorded so far
+    pub fn get_sample_count(&self) -> usize {
+        if let Ok(lock) = SAMPLES.lock() {
+            lock.len()
+        } else {
+            0
+        }
+    }
+
+    /// Get all current samples without stopping
+    pub fn get_current_samples(&self) -> Vec<f32> {
+        if let Ok(lock) = SAMPLES.lock() {
+            lock.clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Default for AudioRecorder {
@@ -112,11 +144,13 @@ impl Default for AudioRecorder {
     }
 }
 
-fn start_recording_internal() -> Result<u32, String> {
+fn start_recording_internal() -> Result<(), String> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .ok_or("No input device available")?;
+
+    println!("Using audio device: {:?}", device.name());
 
     // Get supported config
     let supported_configs = device
@@ -152,6 +186,8 @@ fn start_recording_internal() -> Result<u32, String> {
 
     let sample_rate = config.sample_rate.0;
     let channels = config.channels;
+
+    SAMPLE_RATE.store(sample_rate, Ordering::SeqCst);
 
     let samples_ref = Arc::clone(&SAMPLES);
 
@@ -189,6 +225,9 @@ fn start_recording_internal() -> Result<u32, String> {
         sample_rate, channels
     );
 
+    // Signal that we're ready
+    STREAM_READY.store(true, Ordering::SeqCst);
+
     // Keep the stream alive while recording
     while RECORDING_FLAG.load(Ordering::SeqCst) {
         thread::sleep(std::time::Duration::from_millis(10));
@@ -198,7 +237,7 @@ fn start_recording_internal() -> Result<u32, String> {
     drop(stream);
     println!("Recording stream closed");
 
-    Ok(sample_rate)
+    Ok(())
 }
 
 // Simple linear resampling
