@@ -5,12 +5,13 @@ use audio::AudioRecorder;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State,
 };
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use whisper::{get_available_models, get_models_directory, ModelInfo, SharedWhisperEngine};
 
 // Application state
@@ -18,6 +19,7 @@ pub struct AppState {
     pub recorder: Arc<Mutex<AudioRecorder>>,
     pub whisper: SharedWhisperEngine,
     pub settings: Arc<Mutex<Settings>>,
+    pub previous_window: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,11 +36,24 @@ impl Default for Settings {
         Self {
             model_filename: "ggml-base.bin".to_string(),
             language: "auto".to_string(),
-            hotkey: "Super+Shift+Space".to_string(),
+            hotkey: "Ctrl+Shift+.".to_string(),
             auto_paste: true,
             show_notification: true,
         }
     }
+}
+
+// ===== Helper Functions =====
+
+/// Get the currently focused window address using hyprctl
+fn get_active_window_address() -> Option<String> {
+    let output = Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .output()
+        .ok()?;
+    
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json.get("address")?.as_str().map(|s| s.to_string())
 }
 
 // ===== Tauri Commands =====
@@ -57,7 +72,7 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
     };
 
     if samples.is_empty() {
-        return Err("No audio recorded".to_string());
+        return Ok(String::new());
     }
 
     // Get language setting
@@ -79,6 +94,14 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
     whisper.transcribe(&samples, language.as_deref())
 }
 
+/// Stop recording without transcribing - just cleanup
+#[tauri::command]
+fn stop_recording_silent(state: State<'_, AppState>) -> Result<(), String> {
+    let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    let _ = recorder.stop_recording();
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> {
     let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
@@ -89,6 +112,49 @@ async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> {
 async fn is_recording(state: State<'_, AppState>) -> Result<bool, String> {
     let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
     Ok(recorder.is_recording())
+}
+
+/// Transcribe current audio buffer without stopping recording (for real-time preview)
+#[tauri::command]
+async fn transcribe_current(state: State<'_, AppState>) -> Result<String, String> {
+    let samples = {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.get_current_samples()
+    };
+
+    if samples.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Need at least 0.5 seconds of audio (8000 samples at 16kHz)
+    if samples.len() < 8000 {
+        return Ok(String::new());
+    }
+
+    // Get language setting
+    let language = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        if settings.language == "auto" {
+            None
+        } else {
+            Some(settings.language.clone())
+        }
+    };
+
+    // Transcribe
+    let whisper = state.whisper.lock().map_err(|e| e.to_string())?;
+    if !whisper.is_loaded() {
+        return Err("Model not loaded".to_string());
+    }
+
+    whisper.transcribe_chunk(&samples, language.as_deref())
+}
+
+/// Get sample count for tracking transcription progress
+#[tauri::command]
+async fn get_sample_count(state: State<'_, AppState>) -> Result<usize, String> {
+    let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    Ok(recorder.get_sample_count())
 }
 
 #[tauri::command]
@@ -241,103 +307,151 @@ fn get_input_devices() -> Vec<String> {
     audio::get_input_devices()
 }
 
+/// Called when user finishes dictation - handles everything synchronously before closing
 #[tauri::command]
-async fn type_text(text: String) -> Result<(), String> {
-    // For Hyprland/Wayland: Use wl-copy + wtype or ydotool
-    // First, copy to clipboard
-    let copy_result = Command::new("wl-copy")
-        .arg(&text)
-        .output();
-
-    if copy_result.is_err() {
-        // Fallback to xclip for X11
-        Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()
-            })
-            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
+    // Stop recording immediately
+    {
+        let mut recorder = state.recorder.lock().unwrap();
+        let _ = recorder.stop_recording();
     }
-
-    // Small delay before pasting
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Try wtype first (Wayland)
-    let wtype_result = Command::new("wtype")
-        .arg("-M")
-        .arg("ctrl")
-        .arg("-P")
-        .arg("v")
-        .arg("-m")
-        .arg("ctrl")
-        .output();
-
-    if wtype_result.is_err() {
-        // Fallback to ydotool
-        let ydotool_result = Command::new("ydotool")
-            .args(["key", "29:1", "47:1", "47:0", "29:0"]) // Ctrl+V
-            .output();
-
-        if ydotool_result.is_err() {
-            // Final fallback to xdotool (X11)
-            Command::new("xdotool")
-                .args(["key", "ctrl+v"])
-                .output()
-                .map_err(|e| format!("Failed to paste text: {}", e))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn copy_to_clipboard(text: String) -> Result<(), String> {
-    // Try wl-copy first (Wayland)
-    let result = Command::new("wl-copy")
-        .arg(&text)
-        .output();
-
-    if result.is_err() {
-        // Fallback to xclip (X11)
-        Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()
-            })
-            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
-    }
-
-    Ok(())
-}
-
-fn setup_global_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    // Default hotkey: Super+Shift+Space
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
-
-    let app_handle = app.clone();
     
-    app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
-        if event.state() == ShortcutState::Pressed {
-            // Emit event to frontend
-            app_handle.emit("hotkey-pressed", ()).ok();
+    // Get the previous window address
+    let prev_window = state.previous_window.lock().unwrap().clone();
+    println!("Previous window: {:?}", prev_window);
+    
+    // Hide the window immediately (visually disappears but app keeps running)
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    
+    // Skip if no text
+    if text.trim().is_empty() {
+        println!("No text to paste, exiting");
+        app.exit(0);
+        return;
+    }
+    
+    let text = text.trim().to_string();
+    println!("Text to paste: {}", text);
+    
+    // Small delay for window to fully hide
+    thread::sleep(Duration::from_millis(50));
+    
+    // Copy to clipboard using stdin pipe (more reliable)
+    println!("Copying to clipboard: {}", text);
+    let mut child = match Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to spawn wl-copy: {}", e);
+            app.exit(1);
+            return;
         }
-    })?;
+    };
+    
+    // Write text to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(e) = stdin.write_all(text.as_bytes()) {
+            eprintln!("Failed to write to wl-copy stdin: {}", e);
+            app.exit(1);
+            return;
+        }
+        // stdin is dropped here, closing the pipe
+    }
+    
+    // Wait for wl-copy to fork (it will exit quickly after forking)
+    match child.wait() {
+        Ok(status) => {
+            if status.success() {
+                println!("wl-copy completed successfully");
+            } else {
+                eprintln!("wl-copy exited with status: {}", status);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to wait for wl-copy: {}", e);
+        }
+    }
+    
+    // Small delay to ensure clipboard is ready
+    thread::sleep(Duration::from_millis(50));
+    
+    // Focus previous window if we have one
+    if let Some(addr) = prev_window {
+        println!("Focusing window: {}", addr);
+        let focus_result = Command::new("hyprctl")
+            .args(["dispatch", "focuswindow", &format!("address:{}", addr)])
+            .output();
+        
+        match focus_result {
+            Ok(output) => {
+                println!("Focus result: {}", String::from_utf8_lossy(&output.stdout));
+                if !output.status.success() {
+                    eprintln!("Focus stderr: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to focus window: {}", e);
+            }
+        }
+        
+        // Wait for focus to complete
+        thread::sleep(Duration::from_millis(200));
+    } else {
+        println!("No previous window to focus");
+    }
+    
+    // Verify clipboard has our text
+    if let Ok(output) = Command::new("wl-paste").output() {
+        println!("Clipboard contains: {}", String::from_utf8_lossy(&output.stdout));
+    }
+    
+    // Paste using wtype
+    println!("Pasting with wtype...");
+    let paste_result = Command::new("wtype")
+        .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+        .output();
+    
+    match paste_result {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!("wtype failed: {}", String::from_utf8_lossy(&output.stderr));
+            } else {
+                println!("Paste completed successfully");
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to run wtype: {}", e);
+        }
+    }
+    
+    // Now exit the app
+    println!("Exiting app");
+    app.exit(0);
+}
 
-    app.global_shortcut().register(shortcut)?;
+/// Called on cancel - just cleanup and close
+#[tauri::command]
+fn cancel_recording(app: AppHandle, state: State<'_, AppState>) {
+    // Stop recording
+    {
+        let mut recorder = state.recorder.lock().unwrap();
+        let _ = recorder.stop_recording();
+    }
+    
+    // Exit the app
+    app.exit(0);
+}
 
-    println!("Global shortcut registered: Super+Shift+Space");
+fn setup_global_shortcut(_app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    // Global shortcuts have issues on Wayland/Hyprland
+    // For now, users can use the app window and press Space to record
+    // TODO: Implement proper Wayland global shortcut support via portal or hyprland IPC
+    println!("Note: Global shortcuts disabled on Wayland. Use the app window (Space key) to record.");
     Ok(())
 }
 
@@ -376,6 +490,10 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Capture the previous window BEFORE we create our window
+    let previous_window = get_active_window_address();
+    println!("Captured previous window at startup: {:?}", previous_window);
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -386,6 +504,7 @@ pub fn run() {
             recorder: Arc::new(Mutex::new(AudioRecorder::new())),
             whisper: whisper::create_shared_engine(),
             settings: Arc::new(Mutex::new(Settings::default())),
+            previous_window: Arc::new(Mutex::new(previous_window)),
         })
         .setup(|app| {
             // Setup global shortcut
@@ -403,8 +522,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            stop_recording_silent,
             get_audio_level,
             is_recording,
+            transcribe_current,
+            get_sample_count,
             load_model,
             is_model_loaded,
             get_models,
@@ -415,8 +537,8 @@ pub fn run() {
             get_settings,
             save_settings,
             get_input_devices,
-            type_text,
-            copy_to_clipboard,
+            finish_and_paste,
+            cancel_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
