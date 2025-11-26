@@ -1,156 +1,334 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { onMount, onDestroy } from "svelte";
+  import { Button } from "$lib/components/ui/button";
+  import { Spinner } from "$lib/components/ui/spinner";
+  import Mic from "@lucide/svelte/icons/mic";
+  import MicOff from "@lucide/svelte/icons/mic-off";
+  import Settings from "@lucide/svelte/icons/settings";
+  import X from "@lucide/svelte/icons/x";
+  import Minus from "@lucide/svelte/icons/minus";
+  import Copy from "@lucide/svelte/icons/copy";
+  import ClipboardPaste from "@lucide/svelte/icons/clipboard-paste";
+  import Check from "@lucide/svelte/icons/check";
+  import SettingsPage from "$lib/components/SettingsPage.svelte";
+  import { toast } from "svelte-sonner";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  type AppState = "idle" | "recording" | "processing";
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  let appState: AppState = $state("idle");
+  let transcript = $state("");
+  let showSettings = $state(false);
+  let modelLoaded = $state(false);
+  let copied = $state(false);
+  
+  let levelInterval: ReturnType<typeof setInterval> | null = null;
+  let audioLevels = $state<number[]>(Array(32).fill(0));
+  let unlisteners: UnlistenFn[] = [];
+
+  async function checkModelLoaded() {
+    try {
+      modelLoaded = await invoke<boolean>("is_model_loaded");
+    } catch (e) {
+      console.error("Failed to check model status:", e);
+    }
+  }
+
+  async function startRecording() {
+    if (!modelLoaded) {
+      toast.error("Please load a model first", {
+        description: "Go to Settings to download and select a model."
+      });
+      showSettings = true;
+      return;
+    }
+
+    try {
+      await invoke("start_recording");
+      appState = "recording";
+      transcript = "";
+      
+      // Start monitoring audio levels
+      levelInterval = setInterval(async () => {
+        try {
+          const level = await invoke<number>("get_audio_level");
+          
+          // Update waveform visualization
+          audioLevels = [...audioLevels.slice(1), Math.min(level * 10, 1)];
+        } catch {
+          // Ignore errors while recording
+        }
+      }, 50);
+    } catch (e) {
+      console.error("Failed to start recording:", e);
+      toast.error("Failed to start recording", { description: String(e) });
+    }
+  }
+
+  async function stopRecording() {
+    if (appState !== "recording") return;
+    
+    // Stop level monitoring
+    if (levelInterval) {
+      clearInterval(levelInterval);
+      levelInterval = null;
+    }
+
+    appState = "processing";
+
+    try {
+      const result = await invoke<string>("stop_recording");
+      transcript = result;
+      appState = "idle";
+      
+      // Auto-paste if enabled
+      const settings = await invoke<{ auto_paste: boolean }>("get_settings");
+      if (settings.auto_paste && result.trim()) {
+        await invoke("type_text", { text: result });
+        toast.success("Text pasted!");
+      }
+    } catch (e) {
+      console.error("Transcription failed:", e);
+      toast.error("Transcription failed", { description: String(e) });
+      appState = "idle";
+    }
+  }
+
+  async function toggleRecording() {
+    if (appState === "recording") {
+      await stopRecording();
+    } else if (appState === "idle") {
+      await startRecording();
+    }
+  }
+
+  async function copyTranscript() {
+    if (!transcript) return;
+    
+    try {
+      await invoke("copy_to_clipboard", { text: transcript });
+      copied = true;
+      setTimeout(() => copied = false, 2000);
+      toast.success("Copied to clipboard!");
+    } catch (e) {
+      toast.error("Failed to copy", { description: String(e) });
+    }
+  }
+
+  async function pasteTranscript() {
+    if (!transcript) return;
+    
+    try {
+      await invoke("type_text", { text: transcript });
+      toast.success("Text pasted!");
+    } catch (e) {
+      toast.error("Failed to paste", { description: String(e) });
+    }
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      if (showSettings) {
+        showSettings = false;
+      } else if (appState === "recording") {
+        stopRecording();
+      }
+    }
+    if (e.code === "Space" && !showSettings && appState !== "processing") {
+      e.preventDefault();
+      toggleRecording();
+    }
+  }
+
+  onMount(() => {
+    // Check if model is loaded
+    checkModelLoaded();
+
+    // Listen for hotkey events from backend
+    listen("hotkey-pressed", () => {
+      toggleRecording();
+    }).then(unlisten => unlisteners.push(unlisten));
+
+    // Listen for settings request
+    listen("open-settings", () => {
+      showSettings = true;
+    }).then(unlisten => unlisteners.push(unlisten));
+
+    // Add keyboard listener
+    window.addEventListener("keydown", handleKeydown);
+  });
+
+  onDestroy(() => {
+    if (levelInterval) {
+      clearInterval(levelInterval);
+    }
+    unlisteners.forEach(unlisten => unlisten());
+    window.removeEventListener("keydown", handleKeydown);
+  });
+
+  async function minimizeWindow() {
+    await getCurrentWindow().minimize();
+  }
+
+  async function closeWindow() {
+    await getCurrentWindow().hide();
+  }
+
+  async function startDragging() {
+    await getCurrentWindow().startDragging();
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<svelte:window onkeydown={handleKeydown} />
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+<div class="h-screen w-screen select-none overflow-hidden bg-transparent">
+  {#if showSettings}
+    <SettingsPage 
+      onClose={() => { showSettings = false; checkModelLoaded(); }} 
+    />
+  {:else}
+    <!-- Main Recording UI -->
+    <div 
+      class="flex h-full flex-col rounded-2xl border border-border/50 bg-background/95 backdrop-blur-xl shadow-2xl"
+    >
+      <!-- Custom Title Bar -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="flex h-10 items-center justify-between px-3 cursor-move"
+        onmousedown={startDragging}
+      >
+        <span class="text-sm font-medium text-foreground/80">HyprWhisper</span>
+        <div class="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7 rounded-lg hover:bg-muted"
+            onclick={() => showSettings = true}
+          >
+            <Settings class="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7 rounded-lg hover:bg-muted"
+            onclick={minimizeWindow}
+          >
+            <Minus class="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7 rounded-lg hover:bg-destructive/10 hover:text-destructive"
+            onclick={closeWindow}
+          >
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+      <!-- Content Area -->
+      <div class="flex flex-1 flex-col items-center justify-center gap-4 p-6">
+        {#if !modelLoaded}
+          <!-- No Model Loaded State -->
+          <div class="text-center">
+            <div class="mb-4 rounded-full bg-muted p-4">
+              <MicOff class="h-8 w-8 text-muted-foreground" />
+            </div>
+            <p class="text-sm text-muted-foreground mb-4">No model loaded</p>
+            <Button onclick={() => showSettings = true}>
+              <Settings class="mr-2 h-4 w-4" />
+              Setup Model
+            </Button>
+          </div>
+        {:else if appState === "processing"}
+          <!-- Processing State -->
+          <div class="flex flex-col items-center gap-4">
+            <div class="relative">
+              <Spinner class="h-16 w-16" />
+            </div>
+            <p class="text-sm text-muted-foreground animate-pulse">
+              Transcribing...
+            </p>
+          </div>
+        {:else}
+          <!-- Recording Button -->
+          <button
+            onclick={toggleRecording}
+            class="group relative flex h-24 w-24 items-center justify-center rounded-full transition-all duration-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2
+              {appState === 'recording' 
+                ? 'bg-red-500 hover:bg-red-600 scale-110 shadow-lg shadow-red-500/30' 
+                : 'bg-primary hover:bg-primary/90 hover:scale-105'}"
+          >
+            <!-- Pulsing ring for recording state -->
+            {#if appState === "recording"}
+              <div class="absolute inset-0 animate-ping rounded-full bg-red-500 opacity-30"></div>
+              <div class="absolute inset-0 animate-pulse rounded-full bg-red-500 opacity-20"></div>
+            {/if}
+            
+            {#if appState === "recording"}
+              <MicOff class="h-10 w-10 text-white relative z-10" />
+            {:else}
+              <Mic class="h-10 w-10 text-primary-foreground relative z-10 group-hover:scale-110 transition-transform" />
+            {/if}
+          </button>
 
-<style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
+          <!-- Audio Waveform Visualization -->
+          {#if appState === "recording"}
+            <div class="flex h-12 items-center justify-center gap-[2px]">
+              {#each audioLevels as level}
+                <div
+                  class="w-1 rounded-full bg-red-500 transition-all duration-75"
+                  style="height: {Math.max(4, level * 48)}px; opacity: {0.3 + level * 0.7}"
+                ></div>
+              {/each}
+            </div>
+          {/if}
 
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
+          <!-- Instructions -->
+          <p class="text-center text-sm text-muted-foreground">
+            {#if appState === "recording"}
+              <span class="text-red-500 font-medium">Recording...</span> Press <kbd class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">Space</kbd> or click to stop
+            {:else}
+              Press <kbd class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">Space</kbd> or click to record
+            {/if}
+          </p>
 
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
+          <!-- Transcript Display -->
+          {#if transcript}
+            <div class="w-full mt-2">
+              <div class="rounded-lg border border-border bg-muted/50 p-3 max-h-24 overflow-y-auto">
+                <p class="text-sm text-foreground whitespace-pre-wrap">{transcript}</p>
+              </div>
+              <div class="flex justify-end gap-2 mt-2">
+                <Button variant="outline" size="sm" onclick={copyTranscript}>
+                  {#if copied}
+                    <Check class="mr-1.5 h-3.5 w-3.5 text-green-500" />
+                  {:else}
+                    <Copy class="mr-1.5 h-3.5 w-3.5" />
+                  {/if}
+                  Copy
+                </Button>
+                <Button variant="default" size="sm" onclick={pasteTranscript}>
+                  <ClipboardPaste class="mr-1.5 h-3.5 w-3.5" />
+                  Paste
+                </Button>
+              </div>
+            </div>
+          {/if}
+        {/if}
+      </div>
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
-</style>
+      <!-- Status Bar -->
+      <div class="flex h-8 items-center justify-center border-t border-border/50 px-3">
+        <div class="flex items-center gap-2">
+          <div class="h-2 w-2 rounded-full {modelLoaded ? 'bg-green-500' : 'bg-amber-500'}"></div>
+          <span class="text-xs text-muted-foreground">
+            {modelLoaded ? 'Ready' : 'No model'} • <kbd class="font-mono">Super+Shift+Space</kbd>
+          </span>
+        </div>
+      </div>
+    </div>
+  {/if}
+</div>
