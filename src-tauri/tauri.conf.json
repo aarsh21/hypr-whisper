@@ -16,24 +16,19 @@
         "title": "HyprWhisper",
         "label": "main",
         "width": 400,
-        "height": 300,
-        "minWidth": 320,
-        "minHeight": 200,
-        "resizable": true,
+        "height": 150,
+        "resizable": false,
         "center": true,
         "transparent": true,
         "decorations": false,
-        "alwaysOnTop": false,
-        "skipTaskbar": false,
-        "visible": true
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": true,
+        "focus": true
       }
     ],
     "security": {
       "csp": null
-    },
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true
     }
   },
   "bundle": {
@@ -48,36 +43,8 @@
     ]
   },
   "plugins": {
-    "global-shortcut": {},
     "shell": {
-      "open": true,
-      "scope": [
-        {
-          "name": "wl-copy",
-          "cmd": "wl-copy",
-          "args": true
-        },
-        {
-          "name": "wtype",
-          "cmd": "wtype",
-          "args": true
-        },
-        {
-          "name": "ydotool",
-          "cmd": "ydotool",
-          "args": true
-        },
-        {
-          "name": "xdotool",
-          "cmd": "xdotool",
-          "args": true
-        },
-        {
-          "name": "xclip",
-          "cmd": "xclip",
-          "args": true
-        }
-      ]
+      "open": true
     }
   }
 }
