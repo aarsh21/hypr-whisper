@@ -24,7 +24,7 @@
       levelInterval = setInterval(() => {
         invoke<number>("get_audio_level")
           .then(level => {
-            audioLevels = [...audioLevels.slice(1), Math.max(0.2, Math.min(level * 10, 1))];
+            audioLevels = [...audioLevels.slice(1), Math.max(0.2, Math.min(level * 40, 1))];
           })
           .catch(() => {});
       }, 50);
@@ -85,7 +85,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="w-screen h-screen flex flex-col items-center justify-center gap-2">
+<div class="w-screen h-screen flex flex-col items-center justify-center gap-2 bg-transparent">
   <div class="flex items-center justify-center min-w-[120px] h-10 px-5 bg-[#111] border border-[#333] rounded-full">
     {#if !modelLoaded}
       <span class="text-[#666] text-xs">No model</span>
