@@ -333,13 +333,13 @@ fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
     }
     
     let text = text.trim().to_string();
-    println!("Text to paste: {}", text);
+    println!("Text to type: {}", text);
     
     // Small delay for window to fully hide
     thread::sleep(Duration::from_millis(50));
     
-    // Copy to clipboard using stdin pipe (more reliable)
-    println!("Copying to clipboard: {}", text);
+    // Also copy to clipboard as backup (user can Ctrl+V if wtype fails)
+    println!("Copying to clipboard as backup...");
     let mut child = match Command::new("wl-copy")
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -347,6 +347,7 @@ fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn wl-copy: {}", e);
+            // Continue anyway, wtype might still work
             app.exit(1);
             return;
         }
@@ -357,28 +358,12 @@ fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
         use std::io::Write;
         if let Err(e) = stdin.write_all(text.as_bytes()) {
             eprintln!("Failed to write to wl-copy stdin: {}", e);
-            app.exit(1);
-            return;
         }
         // stdin is dropped here, closing the pipe
     }
     
     // Wait for wl-copy to fork (it will exit quickly after forking)
-    match child.wait() {
-        Ok(status) => {
-            if status.success() {
-                println!("wl-copy completed successfully");
-            } else {
-                eprintln!("wl-copy exited with status: {}", status);
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to wait for wl-copy: {}", e);
-        }
-    }
-    
-    // Small delay to ensure clipboard is ready
-    thread::sleep(Duration::from_millis(50));
+    let _ = child.wait();
     
     // Focus previous window if we have one
     if let Some(addr) = prev_window {
@@ -400,28 +385,24 @@ fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
         }
         
         // Wait for focus to complete
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(150));
     } else {
         println!("No previous window to focus");
     }
     
-    // Verify clipboard has our text
-    if let Ok(output) = Command::new("wl-paste").output() {
-        println!("Clipboard contains: {}", String::from_utf8_lossy(&output.stdout));
-    }
-    
-    // Paste using wtype
-    println!("Pasting with wtype...");
-    let paste_result = Command::new("wtype")
-        .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+    // Type text directly using wtype (more reliable than Ctrl+V for terminals/IDEs)
+    println!("Typing text with wtype...");
+    let type_result = Command::new("wtype")
+        .arg("--")
+        .arg(&text)
         .output();
     
-    match paste_result {
+    match type_result {
         Ok(output) => {
             if !output.status.success() {
                 eprintln!("wtype failed: {}", String::from_utf8_lossy(&output.stderr));
             } else {
-                println!("Paste completed successfully");
+                println!("Text typed successfully");
             }
         }
         Err(e) => {
@@ -507,6 +488,21 @@ pub fn run() {
             previous_window: Arc::new(Mutex::new(previous_window)),
         })
         .setup(|app| {
+            // Set WebView background to transparent on Linux
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    use webkit2gtk::WebViewExt;
+                    
+                    let _ = window.with_webview(|webview| {
+                        // Get the webkit2gtk WebView and set transparent background
+                        let wv = webview.inner();
+                        let rgba = gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
+                        wv.set_background_color(&rgba);
+                    });
+                }
+            }
+            
             // Setup global shortcut
             if let Err(e) = setup_global_shortcut(app.handle()) {
                 eprintln!("Failed to setup global shortcut: {}", e);
