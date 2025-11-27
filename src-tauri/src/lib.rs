@@ -3,7 +3,11 @@ mod whisper;
 
 use audio::AudioRecorder;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +17,87 @@ use tauri::{
     AppHandle, Emitter, Manager, State,
 };
 use whisper::{get_available_models, get_models_directory, ModelInfo, SharedWhisperEngine};
+
+// Socket path for single-instance toggle
+fn get_socket_path() -> PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(runtime_dir).join("hyprwhisper.sock")
+}
+
+// Global flag for stop signal
+static STOP_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// Check if another instance is running and signal it to stop
+/// Returns true if we should exit (signal was sent to existing instance)
+fn check_and_signal_existing_instance() -> bool {
+    let socket_path = get_socket_path();
+    
+    // Try to connect to existing socket
+    if let Ok(mut stream) = UnixStream::connect(&socket_path) {
+        // Send stop signal
+        let _ = stream.write_all(b"STOP");
+        let _ = stream.flush();
+        println!("Sent stop signal to existing instance");
+        true // Exit this instance
+    } else {
+        false // No existing instance, continue
+    }
+}
+
+/// Start listening for stop signals from new instances
+fn start_socket_listener(app_handle: AppHandle) {
+    let socket_path = get_socket_path();
+    
+    // Remove existing socket file
+    let _ = std::fs::remove_file(&socket_path);
+    
+    // Create new socket
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to create socket: {}", e);
+            return;
+        }
+    };
+    
+    // Set non-blocking so we can check the stop flag
+    listener.set_nonblocking(true).ok();
+    
+    thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4];
+                    if stream.read(&mut buf).is_ok() && &buf == b"STOP" {
+                        println!("Received stop signal from new instance");
+                        STOP_SIGNAL.store(true, Ordering::SeqCst);
+                        // Emit event to frontend
+                        app_handle.emit("toggle-stop", ()).ok();
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No connection, sleep briefly
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    eprintln!("Socket error: {}", e);
+                    break;
+                }
+            }
+            
+            // Check if app is exiting
+            if STOP_SIGNAL.load(Ordering::SeqCst) {
+                // Give time for the event to be processed
+                thread::sleep(Duration::from_millis(500));
+                break;
+            }
+        }
+        
+        // Cleanup socket
+        let _ = std::fs::remove_file(get_socket_path());
+    });
+}
 
 // Application state
 pub struct AppState {
@@ -307,91 +392,32 @@ fn get_input_devices() -> Vec<String> {
     audio::get_input_devices()
 }
 
-/// Called when user finishes dictation - handles everything synchronously before closing
+/// Type text directly to the previously focused window using wtype
+/// This is used for real-time dictation - types incrementally as words become stable
 #[tauri::command]
-fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
-    // Stop recording immediately
-    {
-        let mut recorder = state.recorder.lock().unwrap();
-        let _ = recorder.stop_recording();
+fn wtype_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
     }
     
     // Get the previous window address
     let prev_window = state.previous_window.lock().unwrap().clone();
-    println!("Previous window: {:?}", prev_window);
-    
-    // Hide the window immediately (visually disappears but app keeps running)
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
-    }
-    
-    // Skip if no text
-    if text.trim().is_empty() {
-        println!("No text to paste, exiting");
-        app.exit(0);
-        return;
-    }
-    
-    let text = text.trim().to_string();
-    println!("Text to type: {}", text);
-    
-    // Small delay for window to fully hide
-    thread::sleep(Duration::from_millis(50));
-    
-    // Also copy to clipboard as backup (user can Ctrl+V if wtype fails)
-    println!("Copying to clipboard as backup...");
-    let mut child = match Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("Failed to spawn wl-copy: {}", e);
-            // Continue anyway, wtype might still work
-            app.exit(1);
-            return;
-        }
-    };
-    
-    // Write text to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
-            eprintln!("Failed to write to wl-copy stdin: {}", e);
-        }
-        // stdin is dropped here, closing the pipe
-    }
-    
-    // Wait for wl-copy to fork (it will exit quickly after forking)
-    let _ = child.wait();
     
     // Focus previous window if we have one
     if let Some(addr) = prev_window {
-        println!("Focusing window: {}", addr);
         let focus_result = Command::new("hyprctl")
             .args(["dispatch", "focuswindow", &format!("address:{}", addr)])
             .output();
         
-        match focus_result {
-            Ok(output) => {
-                println!("Focus result: {}", String::from_utf8_lossy(&output.stdout));
-                if !output.status.success() {
-                    eprintln!("Focus stderr: {}", String::from_utf8_lossy(&output.stderr));
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to focus window: {}", e);
-            }
+        if let Err(e) = focus_result {
+            eprintln!("Failed to focus window: {}", e);
         }
         
-        // Wait for focus to complete
-        thread::sleep(Duration::from_millis(150));
-    } else {
-        println!("No previous window to focus");
+        // Brief delay for focus to complete
+        thread::sleep(Duration::from_millis(30));
     }
     
-    // Type text directly using wtype (more reliable than Ctrl+V for terminals/IDEs)
-    println!("Typing text with wtype...");
+    // Type text directly using wtype
     let type_result = Command::new("wtype")
         .arg("--")
         .arg(&text)
@@ -400,18 +426,67 @@ fn finish_and_paste(app: AppHandle, state: State<'_, AppState>, text: String) {
     match type_result {
         Ok(output) => {
             if !output.status.success() {
-                eprintln!("wtype failed: {}", String::from_utf8_lossy(&output.stderr));
-            } else {
-                println!("Text typed successfully");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("wtype failed: {}", stderr);
+                return Err(format!("wtype failed: {}", stderr));
             }
         }
         Err(e) => {
             eprintln!("Failed to run wtype: {}", e);
+            return Err(format!("Failed to run wtype: {}", e));
         }
     }
     
-    // Now exit the app
-    println!("Exiting app");
+    Ok(())
+}
+
+/// Exit the application cleanly
+#[tauri::command]
+fn exit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+/// Called when user finishes dictation - types remaining text and exits
+#[tauri::command]
+fn finish_dictation(app: AppHandle, state: State<'_, AppState>, remaining_text: String) {
+    // Stop recording immediately
+    {
+        let mut recorder = state.recorder.lock().unwrap();
+        let _ = recorder.stop_recording();
+    }
+    
+    // Hide the window immediately
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    
+    // Type remaining text if any
+    if !remaining_text.trim().is_empty() {
+        let text = remaining_text.trim().to_string();
+        
+        // Get the previous window address
+        let prev_window = state.previous_window.lock().unwrap().clone();
+        
+        // Small delay for window to fully hide
+        thread::sleep(Duration::from_millis(50));
+        
+        // Focus previous window if we have one
+        if let Some(addr) = prev_window {
+            let _ = Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", &format!("address:{}", addr)])
+                .output();
+            
+            thread::sleep(Duration::from_millis(50));
+        }
+        
+        // Type remaining text
+        let _ = Command::new("wtype")
+            .arg("--")
+            .arg(&text)
+            .output();
+    }
+    
+    // Exit the app
     app.exit(0);
 }
 
@@ -471,6 +546,12 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Toggle mode: check if another instance is running
+    if check_and_signal_existing_instance() {
+        println!("Signaled existing instance to stop, exiting");
+        return;
+    }
+    
     // Capture the previous window BEFORE we create our window
     let previous_window = get_active_window_address();
     println!("Captured previous window at startup: {:?}", previous_window);
@@ -503,6 +584,9 @@ pub fn run() {
                 }
             }
             
+            // Start socket listener for toggle mode
+            start_socket_listener(app.handle().clone());
+            
             // Setup global shortcut
             if let Err(e) = setup_global_shortcut(app.handle()) {
                 eprintln!("Failed to setup global shortcut: {}", e);
@@ -533,7 +617,9 @@ pub fn run() {
             get_settings,
             save_settings,
             get_input_devices,
-            finish_and_paste,
+            wtype_text,
+            exit_app,
+            finish_dictation,
             cancel_recording,
         ])
         .run(tauri::generate_context!())
